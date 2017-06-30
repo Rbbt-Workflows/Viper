@@ -1,11 +1,11 @@
 require 'rbbt-util'
 require 'rbbt/workflow'
+require 'rbbt/sources/organism'
 
 Misc.add_libdir if __FILE__ == $0
 
 #require 'rbbt/sources/Viper'
 
-Workflow.require_workflow "CSBC"
 module Viper
   extend Workflow
 
@@ -17,6 +17,7 @@ module Viper
     organism = "Hsa/feb2014"
 
     found = Set.new
+    tf_modules = Open.read(tf_modules) if Misc.is_filename?(tf_modules)
     TSV.traverse StringIO.new(tf_modules), :type => :array, :into => tsv do |line|
       tf, desc, *targets_raw = line.split("\t")
       targets = []
@@ -59,7 +60,7 @@ module Viper
 
     require 'rbbt/util/R'
     script =<<-EOF
-  library(viper)
+library(viper)
 
 regulon.tsv = rbbt.tsv('#{file('regulon')}')
 
@@ -84,8 +85,6 @@ for (tf in rownames(regulon.tsv)){
   regulon[[tf]] = list(likelihood=likelihood, tfmode=tfmode)
 }
 
-str(regulon)
-
 data = viper(data, regulon)
     EOF
     Open.write(file('script'), script)
@@ -96,6 +95,87 @@ data = viper(data, regulon)
   dep :viper
   task :profile => :tsv do
     step(:viper).load.transpose("Sample")
+  end
+
+  dep :regulon
+  input :data, :tsv, "Expression data"
+  input :main, :array, "Main samples"
+  input :contrast, :array, "Contrast samples"
+  input :organism, :string, "Organism code", Organism.default_code("Hsa")
+  task :msviper => :tsv do |data,main,contrast,organism|
+    regulon = step(:regulon).load
+
+    Open.write(file('regulon'), regulon.to_s)
+
+    organism = Organism.default_code("Hsa") if organism.nil?
+
+    reg_key, count = Organism.guess_id organism, regulon.keys
+    data = TSV.open(data, :cast => :to_f) unless TSV === data
+    data_key = data.key_field
+    data = data.to_list{|v| Misc.mean v}
+
+    if (not reg_key.nil?) and data_key != reg_key
+      data.identifiers = Organism.identifiers(organism)
+      data = data.change_key(reg_key)
+    end
+
+    require 'rbbt/util/R'
+    script =<<-EOF
+library(viper)
+
+regulon.tsv = rbbt.tsv('#{file('regulon')}')
+
+main.samples = #{R.ruby2R main}
+contrast.samples = #{R.ruby2R contrast}
+
+main = as.matrix(data[,main.samples])
+contrast = as.matrix(data[,contrast.samples])
+
+min.genes = 25
+regulon = list()
+for (tf in rownames(regulon.tsv)){
+
+  info = regulon.tsv[tf,]
+
+  targets.str = info$Target
+
+  targets = strsplit(targets.str, '\\\\|') [[1]]
+
+  if (length(targets) > min.genes){
+    likelihood.str = info$Likelihood
+    if (is.null(likelihood.str) || is.na(likelihood.str)){ likelihood = rep(1, length(targets))}
+    else{ likelihood = as.numeric(strsplit(likelihood.str, '\\\\|')[[1]]) }
+
+    tfmode.str = info$Mode
+    if (is.null(tfmode.str) || is.na(tfmode.str)){ tfmode = rep(1, length(targets))}
+    else{ tfmode = as.numeric(strsplit(tfmode.str, '\\\\|')[[1]]) }
+    names(tfmode) = targets
+
+    regulon[[tf]] = list(tfmode=tfmode, likelihood=likelihood)
+  }
+
+}
+
+signature <- rowTtest(main, contrast)
+nullModel <- ttestNull(main, contrast, per=1000)
+
+sig = signature$statistic
+
+res = msviper(sig, regulon, nullModel, minsize = min.genes, verbose=FALSE)
+
+data = data.frame(p.value=res$es$p.value, NES=res$es$nes)
+
+data
+    EOF
+    Open.write(file('script'), script)
+
+    data = data.R script
+
+    data.key_field = "Associated Gene Name"
+    data.namespace = organism
+
+    data
+
   end
 
 end
