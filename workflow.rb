@@ -52,11 +52,21 @@ module Viper
   task :viper => :tsv do |data|
     regulon = step(:regulon).load
 
+    data = TSV.open data unless TSV === data
+
     Open.write(file('regulon'), regulon.to_s)
 
-    data_key = data.key_field
-    reg_key, count = Organism.guess_id "Hsa/feb2014", regulon.keys
-    data = data.change_key(reg_key).to_list{|v| Misc.mean(v)} if data_key != reg_key
+    begin
+      data_key = data.key_field
+      organism = data.namespace || "Hsa/feb2014"
+      reg_key, count = Organism.guess_id organism, regulon.column("Target").values.flatten
+      log :translate, "Translating: #{[data_key, reg_key] * " => "}" unless data_key == reg_key
+      data = data.change_key(reg_key, :identifiers => Organism.identifiers(organism)) if reg_key and data_key != reg_key
+    rescue
+      Log.warn "Could not normalize data identifiers: #{$!.message}"
+    end
+
+    data = data.to_list{|v| Misc.mean(v)}  if data.type == :double
 
     require 'rbbt/util/R'
     script =<<-EOF
