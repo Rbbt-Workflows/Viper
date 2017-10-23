@@ -18,7 +18,9 @@ module Viper
 
     found = Set.new
     tf_modules = Open.read(tf_modules) if Misc.is_filename?(tf_modules)
+    tf_modules = tf_modules.to_s(false)  if TSV === tf_modules
     TSV.traverse StringIO.new(tf_modules), :type => :array, :into => tsv do |line|
+      next if line =~ /^#/
       tf, desc, *targets_raw = line.split("\t")
       targets = []
       signs = []
@@ -49,7 +51,8 @@ module Viper
 
   dep :regulon
   input :data, :tsv, "Expression data"
-  task :viper => :tsv do |data|
+  input :min_genes, :integer, "Minumum number of genes per TF", 10
+  task :viper => :tsv do |data, min_genes|
     regulon = step(:regulon).load
 
     data = TSV.open data unless TSV === data
@@ -70,11 +73,12 @@ module Viper
 
     require 'rbbt/util/R'
     script =<<-EOF
-library(viper)
+rbbt.require('viper')
 
 regulon.tsv = rbbt.tsv('#{file('regulon')}')
 
 regulon = list()
+min.genes = #{min_genes}
 for (tf in rownames(regulon.tsv)){
 
   info = regulon.tsv[tf,]
@@ -83,23 +87,30 @@ for (tf in rownames(regulon.tsv)){
 
   targets = strsplit(targets.str, '\\\\|') [[1]]
 
-  likelihood.str = info$Likelihood
-  if (is.null(likelihood.str) || is.na(likelihood.str)){ likelihood = rep(1, length(targets))}
-  else{ likelihood = as.numeric(strsplit(likelihood.str, '\\\\|')[[1]]) }
+  if (length(targets) > min.genes){
 
-  tfmode.str = info$Mode
-  if (is.null(tfmode.str) || is.na(tfmode.str)){ tfmode = rep(1, length(targets))}
-  else{ tfmode = as.numeric(strsplit(tfmode.str, '\\\\|')[[1]]) }
-  names(tfmode) = targets
+    likelihood.str = info$Likelihood
+    if (is.null(likelihood.str) || is.na(likelihood.str) || likelihood.str == ""){ likelihood = rep(1, length(targets))}
+    else{ likelihood = as.numeric(strsplit(likelihood.str, '\\\\|')[[1]]) }
 
-  regulon[[tf]] = list(likelihood=likelihood, tfmode=tfmode)
+    tfmode.str = info$Mode
+    if (is.null(tfmode.str) || is.na(tfmode.str) || tfmode.str == ""){ tfmode = rep(1, length(targets))}
+    else{ tfmode = as.numeric(strsplit(tfmode.str, '\\\\|')[[1]]) }
+    names(tfmode) = targets
+
+    regulon[[tf]] = list(tfmode=tfmode, likelihood=likelihood)
+  }
 }
 
 data = viper(data, regulon)
     EOF
     Open.write(file('script'), script)
 
-    data.R script
+    begin
+      data.R script
+    rescue
+      raise RbbtException, "Viper failed: #{$!.message}"
+    end
   end
 
   dep :viper
@@ -112,8 +123,14 @@ data = viper(data, regulon)
   input :main, :array, "Main samples"
   input :contrast, :array, "Contrast samples"
   input :organism, :string, "Organism code", Organism.default_code("Hsa")
-  task :msviper => :tsv do |data,main,contrast,organism|
+  input :min_genes, :integer, "Minumum number of genes per TF", 10
+  task :msviper => :tsv do |data,main,contrast,organism, min_genes|
     regulon = step(:regulon).load
+
+    raise ParameterException, "No samples in the main category" if main.nil? or main.empty?
+    raise ParameterException, "Only on sample in the main category" if main.length == 1
+
+    all_genes = regulon.values.flatten.uniq
 
     Open.write(file('regulon'), regulon.to_s)
 
@@ -129,9 +146,27 @@ data = viper(data, regulon)
       data = data.change_key(reg_key)
     end
 
+    data = data.select(all_genes)
+
+    if contrast.nil?
+      contrast = data.fields - main
+    end
+
+    total = data.fields.length
+    min = [contrast.length, main.length].min
+
+    require 'distribution'
+
+    permutations = Math.factorial(total) / (Math.factorial(min) * Math.factorial(total - min))
+
+    raise ParameterException, "Not enough permutations to compute statistics" if permutations < 100
+    permutations -= 1
+
+    permutations = 1000 if permutations > 1000
+
     require 'rbbt/util/R'
     script =<<-EOF
-library(viper)
+rbbt.require('viper')
 
 regulon.tsv = rbbt.tsv('#{file('regulon')}')
 
@@ -141,7 +176,7 @@ contrast.samples = #{R.ruby2R contrast}
 main = as.matrix(data[,main.samples])
 contrast = as.matrix(data[,contrast.samples])
 
-min.genes = 25
+min.genes = #{min_genes}
 regulon = list()
 for (tf in rownames(regulon.tsv)){
 
@@ -151,13 +186,13 @@ for (tf in rownames(regulon.tsv)){
 
   targets = strsplit(targets.str, '\\\\|') [[1]]
 
-  if (length(targets) > min.genes){
+  if (length(targets) >= min.genes){
     likelihood.str = info$Likelihood
-    if (is.null(likelihood.str) || is.na(likelihood.str)){ likelihood = rep(1, length(targets))}
+    if (is.null(likelihood.str) || is.na(likelihood.str) || likelihood.str == ""){ likelihood = rep(1, length(targets))}
     else{ likelihood = as.numeric(strsplit(likelihood.str, '\\\\|')[[1]]) }
 
     tfmode.str = info$Mode
-    if (is.null(tfmode.str) || is.na(tfmode.str)){ tfmode = rep(1, length(targets))}
+    if (is.null(tfmode.str) || is.na(tfmode.str) || tfmode.str == ""){ tfmode = rep(1, length(targets))}
     else{ tfmode = as.numeric(strsplit(tfmode.str, '\\\\|')[[1]]) }
     names(tfmode) = targets
 
@@ -167,7 +202,7 @@ for (tf in rownames(regulon.tsv)){
 }
 
 signature <- rowTtest(main, contrast)
-nullModel <- ttestNull(main, contrast, per=1000)
+nullModel <- ttestNull(main, contrast, per=#{permutations})
 
 sig = signature$statistic
 
@@ -179,13 +214,16 @@ data
     EOF
     Open.write(file('script'), script)
 
-    data = data.R script
+    begin
+      data = data.R script
 
-    data.key_field = "Associated Gene Name"
-    data.namespace = organism
+      data.key_field = "Associated Gene Name"
+      data.namespace = organism
 
-    data
-
+      data
+    rescue
+      raise RbbtException, "Viper failed: #{$!.message}"
+    end
   end
 
 end
