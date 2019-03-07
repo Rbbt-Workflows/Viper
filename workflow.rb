@@ -55,7 +55,7 @@ module Viper
   task :viper => :tsv do |data, min_genes|
     regulon = step(:regulon).load
 
-    data = TSV.open data unless TSV === data
+    data = TSV.open data, :unnamed => true unless TSV === data
 
     Open.write(file('regulon'), regulon.to_s)
 
@@ -63,13 +63,15 @@ module Viper
       data_key = data.key_field
       organism = data.namespace || "Hsa/feb2014"
       reg_key, count = Organism.guess_id organism, regulon.column("Target").values.flatten
-      log :translate, "Translating: #{[data_key, reg_key] * " => "}" unless data_key == reg_key
-      data = data.change_key(reg_key, :identifiers => Organism.identifiers(organism)) if reg_key and data_key != reg_key
+      if reg_key and data_key != reg_key
+        log :translate, "Translating: #{[data_key, reg_key] * " => "}" unless data_key == reg_key
+        data = data.change_key(reg_key, :identifiers => Organism.identifiers(organism)) 
+      end
     rescue
       Log.warn "Could not normalize data identifiers: #{$!.message}"
     end
 
-    data = data.to_list{|v| Misc.mean(v)}  if data.type == :double
+    data = data.to_list{|v| Misc.mean(v.compact.collect{|v| v.to_f})}  if data.type == :double
 
     require 'rbbt/util/R'
     script =<<-EOF
